@@ -129,7 +129,7 @@ zig build test   # Run tests
 
 ## Documentation
 
-Full documentation available at [docs.zzz.seemsindie.com](https://docs.zzz.seemsindie.com) under the Templates section.
+Full documentation available at [docs.zzz.indielab.link](https://docs.zzz.indielab.link) under the Templates section.
 
 ## Ecosystem
 
