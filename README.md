@@ -129,13 +129,13 @@ zig build test   # Run tests
 
 ## Documentation
 
-Full documentation available at [docs.pidgn.indielab.link](https://docs.pidgn.indielab.link) under the Templates section.
+Full documentation available at [docs.pidgn.seemsindie.com](https://docs.pidgn.seemsindie.com) under the Templates section.
 
 ## Ecosystem
 
 | Package | Description |
 |---------|-------------|
-| [pidgn.zig](https://github.com/seemsindie/pidgn.zig) | Core web framework |
+| [pidgn.zig](https://github.com/seemsindie/pidgn) | Core web framework |
 | [pidgn_db](https://github.com/seemsindie/pidgn_db) | Database ORM (SQLite + PostgreSQL) |
 | [pidgn_jobs](https://github.com/seemsindie/pidgn_jobs) | Background job processing |
 | [pidgn_mailer](https://github.com/seemsindie/pidgn_mailer) | Email sending |
