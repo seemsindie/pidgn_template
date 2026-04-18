@@ -2,6 +2,33 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const html_escape = @import("html_escape.zig");
 
+// ── i18n render hook ───────────────────────────────────────────────────
+// pidgn.zig registers a translator callback here so the `t` and `tn` pipes
+// can look up translations at render time without the template engine
+// importing anything from the pidgn framework. The callback is stored in a
+// thread-local so concurrent worker threads don't collide.
+//
+// Signature: (allocator, locale, key, count) — `count == null` means plain
+// lookup; `count != null` selects a plural form.
+
+pub const TranslateFn = *const fn (Allocator, []const u8, []const u8, ?u32) anyerror![]const u8;
+
+threadlocal var tl_translator: ?TranslateFn = null;
+threadlocal var tl_locale: []const u8 = "";
+
+pub fn setTranslator(f: ?TranslateFn) void {
+    tl_translator = f;
+}
+
+pub fn setLocale(locale: []const u8) void {
+    tl_locale = locale;
+}
+
+pub fn clearI18n() void {
+    tl_translator = null;
+    tl_locale = "";
+}
+
 /// A single segment of a parsed template.
 pub const Segment = union(enum) {
     literal: []const u8,
@@ -25,6 +52,10 @@ pub const Segment = union(enum) {
         path: []const u8,
         pipes: []const Pipe,
         is_raw: bool,
+        /// When true, `path` holds an already-unquoted literal string (from a
+        /// form like `{{"key" | t}}`) and should be used verbatim at render
+        /// time instead of being resolved against `data`.
+        path_is_literal: bool = false,
     };
 
     pub const Conditional = struct {
@@ -472,10 +503,15 @@ fn parsePipedVariable(comptime content: []const u8, comptime is_raw: bool) Segme
         }
 
         const final = pipes;
+        // Quoted-literal path: `{{"key" | t}}` stores the inner text as a
+        // literal so renderSegments skips field resolution.
+        const is_lit = path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"';
+        const effective_path = if (is_lit) path[1 .. path.len - 1] else path;
         return .{
-            .path = path,
+            .path = effective_path,
             .pipes = &final,
             .is_raw = is_raw,
+            .path_is_literal = is_lit,
         };
     }
 }
@@ -812,8 +848,10 @@ fn renderSegments(comptime segments: []const Segment, data: anytype, buf: *std.A
                 try buf.appendSlice(allocator, text);
             },
             .piped_variable => |pv| {
-                const value = resolveField(data, pv.path);
-                var str = try renderValue(value, allocator);
+                var str: []const u8 = if (pv.path_is_literal) pv.path else blk: {
+                    const value = resolveField(data, pv.path);
+                    break :blk try renderValue(value, allocator);
+                };
                 // Apply each pipe in sequence
                 inline for (pv.pipes) |pipe| {
                     str = try applyPipe(allocator, str, pipe);
@@ -1148,6 +1186,19 @@ fn applyPipe(allocator: Allocator, input: []const u8, comptime pipe: Segment.Pip
     if (comptime eql(pipe.name, "format_date")) {
         const ts = std.fmt.parseInt(i64, input, 10) catch return input;
         return formatTimestamp(allocator, ts, pipe.arg);
+    }
+
+    if (comptime eql(pipe.name, "t")) {
+        // Lookup-only translation: input is the key.
+        const resolver = tl_translator orelse return input;
+        return resolver(allocator, tl_locale, input, null);
+    }
+
+    if (comptime eql(pipe.name, "tn")) {
+        // Plural translation: input is the count, pipe.arg is the key.
+        const resolver = tl_translator orelse return pipe.arg;
+        const n = std.fmt.parseInt(u32, input, 10) catch 0;
+        return resolver(allocator, tl_locale, pipe.arg, n);
     }
 
     // Unknown pipe — passthrough
@@ -1614,4 +1665,184 @@ test "pipe: format_date non-numeric passthrough" {
     const T = template("{{val | format_date:\"YYYY-MM-DD\"}}");
     const result = try T.render(alloc, .{ .val = "not-a-number" });
     try std.testing.expectEqualStrings("not-a-number", result);
+}
+
+// ── i18n pipe tests ───────────────────────────────────────────────────
+// These install a stub translator so the engine can be tested without
+// pidgn.zig. Every test clears the thread-local on exit so subsequent
+// tests start from a clean state.
+
+const StubTranslator = struct {
+    fn upperLookup(alloc: Allocator, locale: []const u8, key: []const u8, count: ?u32) anyerror![]const u8 {
+        _ = locale;
+        if (count) |n| {
+            var buf: [32]u8 = undefined;
+            const prefix = "N=";
+            const ns = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+            const out = try alloc.alloc(u8, prefix.len + ns.len + key.len + 1);
+            @memcpy(out[0..prefix.len], prefix);
+            @memcpy(out[prefix.len..][0..ns.len], ns);
+            out[prefix.len + ns.len] = ':';
+            @memcpy(out[prefix.len + ns.len + 1 ..], key);
+            return out;
+        }
+        // Upper-case the key as a stand-in for a translation.
+        const out = try alloc.alloc(u8, key.len);
+        for (key, 0..) |c, i| out[i] = if (c >= 'a' and c <= 'z') c - 32 else c;
+        return out;
+    }
+
+    fn htmlLookup(alloc: Allocator, locale: []const u8, key: []const u8, count: ?u32) anyerror![]const u8 {
+        _ = alloc;
+        _ = locale;
+        _ = key;
+        _ = count;
+        return "<b>hi</b>";
+    }
+};
+
+test "pipe: t calls installed resolver" {
+    setTranslator(&StubTranslator.upperLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{\"hello\" | t}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("HELLO", result);
+}
+
+test "pipe: t falls back to key when no resolver installed" {
+    clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{\"unknown_key\" | t}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("unknown_key", result);
+}
+
+test "pipe: t composes with upper" {
+    // Resolver returns lowercase; `upper` after `t` should uppercase it.
+    const S = struct {
+        fn resolver(alloc: Allocator, locale: []const u8, key: []const u8, count: ?u32) anyerror![]const u8 {
+            _ = locale;
+            _ = key;
+            _ = count;
+            return alloc.dupe(u8, "bonjour");
+        }
+    };
+    setTranslator(&S.resolver);
+    setLocale("fr");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{\"greet\" | t | upper}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("BONJOUR", result);
+}
+
+test "pipe: t HTML-escapes by default" {
+    setTranslator(&StubTranslator.htmlLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{\"x\" | t}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("&lt;b&gt;hi&lt;/b&gt;", result);
+}
+
+test "pipe: t with raw braces skips escape" {
+    setTranslator(&StubTranslator.htmlLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{{\"x\" | t}}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("<b>hi</b>", result);
+}
+
+test "pipe: t with dynamic key from data" {
+    setTranslator(&StubTranslator.upperLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{key_var | t}}");
+    const result = try T.render(alloc, .{ .key_var = "hello" });
+    try std.testing.expectEqualStrings("HELLO", result);
+}
+
+test "pipe: tn passes count to resolver" {
+    setTranslator(&StubTranslator.upperLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{count | tn:\"items\"}}");
+    const result = try T.render(alloc, .{ .count = @as(u32, 5) });
+    try std.testing.expectEqualStrings("N=5:items", result);
+}
+
+test "pipe: tn with zero count" {
+    setTranslator(&StubTranslator.upperLookup);
+    setLocale("en");
+    defer clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{count | tn:\"items\"}}");
+    const result = try T.render(alloc, .{ .count = @as(u32, 0) });
+    try std.testing.expectEqualStrings("N=0:items", result);
+}
+
+test "pipe: tn without resolver returns key" {
+    clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const T = template("{{count | tn:\"items\"}}");
+    const result = try T.render(alloc, .{ .count = @as(u32, 5) });
+    try std.testing.expectEqualStrings("items", result);
+}
+
+test "clearI18n resets thread-local state" {
+    setTranslator(&StubTranslator.upperLookup);
+    setLocale("fr");
+    clearI18n();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // After clear, `t` pipe falls back to the key.
+    const T = template("{{\"hi\" | t}}");
+    const result = try T.render(alloc, .{});
+    try std.testing.expectEqualStrings("hi", result);
 }
