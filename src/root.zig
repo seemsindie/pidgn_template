@@ -11,6 +11,13 @@ pub const parse = engine.parse;
 pub const Segment = engine.Segment;
 pub const html_escape = @import("html_escape.zig");
 
+// i18n hook — pidgn.zig installs a translator here before each render. See
+// `engine.TranslateFn` for the callback signature.
+pub const TranslateFn = engine.TranslateFn;
+pub const setTranslator = engine.setTranslator;
+pub const setLocale = engine.setLocale;
+pub const clearI18n = engine.clearI18n;
+
 test {
     _ = engine;
     _ = html_escape;
